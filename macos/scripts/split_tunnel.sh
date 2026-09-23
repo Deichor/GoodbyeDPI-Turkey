@@ -23,6 +23,15 @@ SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
 DOMAINS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/split-tunnel-domains.txt"
 DOMAINS="$ETC_DIR/split-tunnel-domains.txt"
+BRIDGE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/connect_bridge.py"
+BRIDGE_PORT="1086"
+BRIDGE_URL="http://127.0.0.1:$BRIDGE_PORT"
+BRIDGE_LABEL="com.cagritaskn.goodbyedpi-turkey-bridge"
+BRIDGE_PLIST="/Library/LaunchDaemons/$BRIDGE_LABEL.plist"
+ENV_LABEL="com.cagritaskn.goodbyedpi-turkey-env"
+ENV_PLIST="/Library/LaunchAgents/$ENV_LABEL.plist"
+ENV_VARS="HTTPS_PROXY https_proxy"
+NO_PROXY_LIST="localhost,127.0.0.1,::1,*.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,169.254.0.0/16"
 
 [[ $EUID -eq 0 ]] || { echo "sudo ile calistirin: sudo $0 ${1:-}" >&2; exit 1; }
 
@@ -87,10 +96,97 @@ PLIST
     launchctl bootstrap system "$PAC_PLIST"
 }
 
+# Apps that ignore PAC and only read HTTPS_PROXY (Discord's updater) need an
+# HTTP proxy. connect_bridge.py applies the same domain list as the PAC file.
+install_bridge() {
+    cp "$BRIDGE_SRC" "$ETC_DIR/connect_bridge.py"
+    chmod 644 "$ETC_DIR/connect_bridge.py"
+    cat >"$BRIDGE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$BRIDGE_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>$ETC_DIR/connect_bridge.py</string>
+        <string>$BRIDGE_PORT</string>
+        <string>$SOCKS_PORT</string>
+        <string>$DOMAINS</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+PLIST
+    chmod 644 "$BRIDGE_PLIST"
+    launchctl bootout "system/$BRIDGE_LABEL" 2>/dev/null || true
+    launchctl bootstrap system "$BRIDGE_PLIST"
+}
+
+# launchctl setenv does not survive a reboot, so a LaunchAgent sets it again
+# at every login. Apps inherit it only when started after it is set.
+env_cmd() {
+    local cmd="" v
+    for v in $ENV_VARS; do
+        if [[ "$1" == set ]]; then
+            cmd+="launchctl setenv $v $BRIDGE_URL; "
+        else
+            cmd+="launchctl unsetenv $v; "
+        fi
+    done
+    if [[ "$1" == set ]]; then
+        cmd+="launchctl setenv NO_PROXY '$NO_PROXY_LIST'; launchctl setenv no_proxy '$NO_PROXY_LIST'"
+    else
+        cmd+="launchctl unsetenv NO_PROXY; launchctl unsetenv no_proxy"
+    fi
+    echo "$cmd"
+}
+
+console_uid() {
+    stat -f %u /dev/console
+}
+
+install_env() {
+    cat >"$ENV_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$ENV_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>$(env_cmd set)</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+    chmod 644 "$ENV_PLIST"
+    launchctl asuser "$(console_uid)" /bin/sh -c "$(env_cmd set)"
+}
+
+remove_env() {
+    rm -f "$ENV_PLIST"
+    launchctl asuser "$(console_uid)" /bin/sh -c "$(env_cmd unset)" || true
+}
+
 case "${1:-status}" in
 on)
     write_pac
     install_pac_server
+    install_bridge
+    install_env
     for _ in {1..20}; do
         curl -sf --max-time 2 --noproxy '*' "$PAC_URL" >/dev/null 2>&1 && break
         sleep 0.25
@@ -102,12 +198,16 @@ on)
         networksetup -setautoproxyurl "$svc" "$PAC_URL" || true
         networksetup -setautoproxystate "$svc" on || true
     done < <(services)
-    echo "Split tunnel acik. ciadpi'den gecen domainler ($DOMAINS):"
+    echo "Split tunnel acik. HTTPS_PROXY=$BRIDGE_URL (acik uygulamalari yeniden baslatin)."
+    echo "ciadpi'den gecen domainler ($DOMAINS):"
     grep -vE '^[[:space:]]*(#|$)' "$DOMAINS" | sed 's/^/  - /'
     ;;
 off)
     launchctl bootout "system/$PAC_LABEL" 2>/dev/null || true
     rm -f "$PAC_PLIST"
+    launchctl bootout "system/$BRIDGE_LABEL" 2>/dev/null || true
+    rm -f "$BRIDGE_PLIST"
+    remove_env
     while read -r svc; do
         networksetup -setautoproxystate "$svc" off || true
         networksetup -setsocksfirewallproxy "$svc" "$SOCKS_HOST" "$SOCKS_PORT" || true
